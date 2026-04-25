@@ -70,10 +70,7 @@ async function setupDatabase() {
     )`
   ];
 
-  for (const query of queries) {
-    const { error } = await supabase.rpc('exec', { sql: query }).catch(() => ({ error: null }));
-    // Tables may already exist — ignore errors
-  }
+  // Tables are created manually via Supabase SQL editor
   console.log('Database ready');
 }
 
