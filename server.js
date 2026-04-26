@@ -244,7 +244,7 @@ app.post('/api/checkout', requireAuth, async (req, res) => {
 });
 
 // Stripe webhook — auto-activates account on payment
-app.post('/api/webhook', async (req, res) => {
+app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
