@@ -773,6 +773,26 @@ async function handlePurchase() {
   });
 })();
 
+// Handle return from Stripe payment
+(async function() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('payment') === 'success') {
+    // Clean the URL
+    window.history.replaceState({}, '', '/');
+    // Refresh user access
+    await checkAccess();
+    // Show success message
+    const banner = document.createElement('div');
+    banner.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:#38d8e0;color:#060a14;padding:16px 32px;border-radius:12px;font-weight:700;font-size:1rem;z-index:9999;box-shadow:0 4px 24px rgba(56,216,224,0.4)';
+    banner.textContent = '🎉 Payment successful! Welcome to AI Mastery.';
+    document.body.appendChild(banner);
+    setTimeout(() => banner.remove(), 5000);
+    // Go straight to the course
+    setTimeout(() => showView('dashboard'), 500);
+    return;
+  }
+})();
+
 checkAccess();
 
 if ('serviceWorker' in navigator) {
