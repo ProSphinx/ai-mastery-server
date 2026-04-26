@@ -720,10 +720,48 @@ async function initApp() {
 
   // Check if returning from Stripe payment
   var params = new URLSearchParams(window.location.search);
-  if (params.get('paid') === '1') {
+  if (params.get('payment') === 'success') {
     window.history.replaceState({}, '', window.location.pathname);
-    if (hasAccess) safeShowView('dashboard');
+    if (hasAccess) {
+      safeShowView('dashboard');
+    } else {
+      // Webhook may not have fired yet — poll until access granted (max 30s)
+      showPaymentProcessing();
+      var attempts = 0;
+      var poll = setInterval(async function() {
+        attempts++;
+        try {
+          var r = await fetch('/api/auth/me', { credentials: 'include' });
+          var d = await r.json();
+          if (d.user && d.user.has_access) {
+            clearInterval(poll);
+            currentUser = d.user;
+            hasAccess = true;
+            hidePaymentProcessing();
+            safeShowView('dashboard');
+          }
+        } catch(e) {}
+        if (attempts >= 15) {
+          clearInterval(poll);
+          hidePaymentProcessing();
+          alert('Payment received! Please sign out and sign back in to access the course.');
+        }
+      }, 2000);
+    }
   }
+}
+
+function showPaymentProcessing() {
+  var el = document.createElement('div');
+  el.id = 'payment-processing';
+  el.style.cssText = 'position:fixed;inset:0;background:rgba(6,10,20,0.95);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;color:#fff;font-family:inherit';
+  el.innerHTML = '<div style="font-size:2rem;margin-bottom:16px">🎉</div><div style="font-size:1.2rem;font-weight:700;margin-bottom:8px">Payment confirmed!</div><div style="opacity:0.7;font-size:0.9rem">Activating your account...</div><div style="margin-top:24px;width:40px;height:40px;border:3px solid #1a8fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite"></div><style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
+  document.body.appendChild(el);
+}
+
+function hidePaymentProcessing() {
+  var el = document.getElementById('payment-processing');
+  if (el) el.remove();
 }
 
 window.addEventListener('load', initApp);
@@ -771,26 +809,6 @@ async function handlePurchase() {
       html.setAttribute('data-theme', 'light');
     }
   });
-})();
-
-// Handle return from Stripe payment
-(async function() {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get('payment') === 'success') {
-    // Clean the URL
-    window.history.replaceState({}, '', '/');
-    // Refresh user access
-    await checkAccess();
-    // Show success message
-    const banner = document.createElement('div');
-    banner.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:#38d8e0;color:#060a14;padding:16px 32px;border-radius:12px;font-weight:700;font-size:1rem;z-index:9999;box-shadow:0 4px 24px rgba(56,216,224,0.4)';
-    banner.textContent = '🎉 Payment successful! Welcome to AI Mastery.';
-    document.body.appendChild(banner);
-    setTimeout(() => banner.remove(), 5000);
-    // Go straight to the course
-    setTimeout(() => showView('dashboard'), 500);
-    return;
-  }
 })();
 
 checkAccess();
