@@ -10,6 +10,15 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ── Env Validation ────────────────────────────────────────────
+const REQUIRED_VARS = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'JWT_SECRET', 'STRIPE_SECRET_KEY', 'STRIPE_PAYMENT_LINK'];
+const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+if (missing.length) {
+  console.error('❌ Missing required environment variables:', missing.join(', '));
+  console.error('Set these in Render → Environment before starting.');
+  // Don't crash — still start so you can see logs, but log clearly
+}
+
 // ── Supabase ──────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -23,11 +32,8 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(cookieParser());
 app.use(express.json());
 
-// Stripe webhook needs raw body
+// Stripe webhook needs raw body — must be before express.static
 app.use('/webhook', express.raw({ type: 'application/json' }));
-
-// Serve static files
-app.use(express.static(path.join(__dirname)));
 
 // ── Auth Middleware ───────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -41,37 +47,14 @@ function requireAuth(req, res, next) {
   }
 }
 
-// ── Database Setup ────────────────────────────────────────────
-async function setupDatabase() {
-  // Create tables if they don't exist
-  const queries = [
-    `CREATE TABLE IF NOT EXISTS public.profiles (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      has_access BOOLEAN DEFAULT FALSE,
-      stripe_payment_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )`,
-    `CREATE TABLE IF NOT EXISTS public.user_stats (
-      user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
-      xp INTEGER DEFAULT 0,
-      streak INTEGER DEFAULT 0,
-      last_activity DATE
-    )`,
-    `CREATE TABLE IF NOT EXISTS public.progress (
-      id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-      user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
-      lesson_day INTEGER NOT NULL,
-      completed BOOLEAN DEFAULT FALSE,
-      score INTEGER DEFAULT 0,
-      completed_at TIMESTAMPTZ,
-      UNIQUE(user_id, lesson_day)
-    )`
-  ];
-
-  // Tables are created manually via Supabase SQL editor
-  console.log('Database ready');
+function getAuthUser(req) {
+  try {
+    const token = req.cookies.aim_token || req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return null;
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
 }
 
 // ── Health / Keep-Alive ──────────────────────────────────────
@@ -79,14 +62,12 @@ app.get('/ping', (req, res) => res.json({ status: 'ok', time: new Date().toISOSt
 
 // ── Auth Routes ───────────────────────────────────────────────
 
-// Register
 app.post('/api/auth/register', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
   try {
-    // Check if email already exists
     const { data: existing } = await supabase
       .from('profiles')
       .select('id')
@@ -95,10 +76,8 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (existing) return res.status(400).json({ error: 'An account with this email already exists' });
 
-    // Hash password
     const password_hash = await bcrypt.hash(password, 12);
 
-    // Create user
     const { data: user, error } = await supabase
       .from('profiles')
       .insert({ email: email.toLowerCase(), password_hash })
@@ -107,10 +86,8 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (error) throw error;
 
-    // Create stats row
     await supabase.from('user_stats').insert({ user_id: user.id });
 
-    // Issue JWT
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     res.cookie('aim_token', token, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 30 * 24 * 60 * 60 * 1000 });
 
@@ -121,7 +98,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -148,13 +124,11 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Logout
 app.post('/api/auth/logout', (req, res) => {
   res.clearCookie('aim_token');
   res.json({ success: true });
 });
 
-// Get current user
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const { data: user } = await supabase
@@ -177,7 +151,6 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 
 // ── Progress Routes ───────────────────────────────────────────
 
-// Get all progress
 app.get('/api/progress', requireAuth, async (req, res) => {
   const { data } = await supabase
     .from('progress')
@@ -186,7 +159,6 @@ app.get('/api/progress', requireAuth, async (req, res) => {
   res.json(data || []);
 });
 
-// Save lesson progress
 app.post('/api/progress', requireAuth, async (req, res) => {
   const { lesson_day, completed, score } = req.body;
   try {
@@ -204,7 +176,6 @@ app.post('/api/progress', requireAuth, async (req, res) => {
 
     if (error) throw error;
 
-    // Update XP and streak
     if (completed) {
       const today = new Date().toISOString().split('T')[0];
       const { data: stats } = await supabase
@@ -237,16 +208,19 @@ app.post('/api/progress', requireAuth, async (req, res) => {
 
 // ── Stripe Routes ─────────────────────────────────────────────
 
-// Create checkout session
+// Create checkout — user must be logged in
 app.post('/api/checkout', requireAuth, async (req, res) => {
   const paymentLink = process.env.STRIPE_PAYMENT_LINK;
-
-  // Append user id so webhook can activate account after payment
+  if (!paymentLink) {
+    console.error('STRIPE_PAYMENT_LINK not set');
+    return res.status(500).json({ error: 'Payment not configured. Contact support.' });
+  }
+  // Pass user ID so webhook can activate the right account
   const url = `${paymentLink}?client_reference_id=${req.user.id}`;
   res.json({ url });
 });
 
-// Stripe webhook — auto-activates account on payment
+// Stripe webhook — activates account after payment
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -256,9 +230,11 @@ app.post('/webhook', async (req, res) => {
     if (webhookSecret) {
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
     } else {
+      console.warn('STRIPE_WEBHOOK_SECRET not set — skipping signature verification');
       event = JSON.parse(req.body);
     }
   } catch (e) {
+    console.error('Webhook verification failed:', e.message);
     return res.status(400).json({ error: 'Webhook verification failed' });
   }
 
@@ -268,42 +244,94 @@ app.post('/webhook', async (req, res) => {
     const customerEmail = session.customer_details?.email || session.customer_email;
     const paymentId = session.payment_intent || session.id;
 
-    console.log(`Webhook received: userId=${userId}, email=${customerEmail}`);
+    console.log(`Webhook: payment completed. userId=${userId}, email=${customerEmail}`);
 
     if (userId) {
-      // Match by user ID (most reliable)
-      const { error } = await supabase.from('profiles').update({
-        has_access: true,
-        stripe_payment_id: paymentId
-      }).eq('id', userId);
-      console.log(`Access granted by ID to user: ${userId}, error: ${error}`);
+      const { error } = await supabase.from('profiles')
+        .update({ has_access: true, stripe_payment_id: paymentId })
+        .eq('id', userId);
+      if (error) console.error('Supabase update by ID failed:', error);
+      else console.log(`✅ Access granted to user ID: ${userId}`);
     } else if (customerEmail) {
-      // Fallback: match by email
-      const { error } = await supabase.from('profiles').update({
-        has_access: true,
-        stripe_payment_id: paymentId
-      }).eq('email', customerEmail);
-      console.log(`Access granted by email to: ${customerEmail}, error: ${error}`);
+      const { error } = await supabase.from('profiles')
+        .update({ has_access: true, stripe_payment_id: paymentId })
+        .eq('email', customerEmail.toLowerCase());
+      if (error) console.error('Supabase update by email failed:', error);
+      else console.log(`✅ Access granted to email: ${customerEmail}`);
     } else {
-      console.log('Webhook: no userId or email found in session', JSON.stringify(session));
+      console.error('Webhook: no userId or email found in session');
     }
   }
 
   res.json({ received: true });
 });
 
-// ── PWA / App Routes ──────────────────────────────────────────
+// ── Gate app.js — only serve full course to paying users ──────
+app.get('/app.js', (req, res, next) => {
+  const user = getAuthUser(req);
+  if (user) {
+    // Check Supabase for has_access (async)
+    supabase.from('profiles')
+      .select('has_access')
+      .eq('id', user.id)
+      .single()
+      .then(({ data }) => {
+        if (data?.has_access) return next();
+        serveAppStub(res);
+      })
+      .catch(() => serveAppStub(res));
+  } else {
+    serveAppStub(res);
+  }
+});
+
+function serveAppStub(res) {
+  res.type('application/javascript');
+  res.send(`
+(function(){
+  document.querySelectorAll('.view').forEach(function(v){v.classList.remove('view--active');});
+  var hero = document.getElementById('view-hero');
+  if (hero) hero.classList.add('view--active');
+})();
+function showView(v) {
+  if (v !== 'hero') {
+    var m = document.getElementById('paywall-modal');
+    if (m) m.style.display = 'flex';
+    return;
+  }
+  document.querySelectorAll('.view').forEach(function(el){el.classList.remove('view--active');});
+  var hero = document.getElementById('view-hero');
+  if (hero) hero.classList.add('view--active');
+}
+function renderDashboard() {}
+function generateCert() {}
+  `);
+}
+
+// ── PWA Routes ────────────────────────────────────────────────
 app.get('/manifest.json', (req, res) => res.sendFile(path.join(__dirname, 'manifest.json')));
 app.get('/sw.js', (req, res) => res.sendFile(path.join(__dirname, 'sw.js')));
 app.get('/.well-known/assetlinks.json', (req, res) => {
-  res.json([{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app', package_name: 'com.aimastery.course', sha256_cert_fingerprints: ['29:15:86:DC:53:4E:DA:F1:E5:76:80:AC:90:B3:DC:B6:71:A2:B2:A8:D7:4A:96:F8:32:4D:E2:FD:DA:57:27:2A'] } }]);
+  res.json([{
+    relation: ['delegate_permission/common.handle_all_urls'],
+    target: {
+      namespace: 'android_app',
+      package_name: 'com.aimastery.course',
+      sha256_cert_fingerprints: ['29:15:86:DC:53:4E:DA:F1:E5:76:80:AC:90:B3:DC:B6:71:A2:B2:A8:D7:4A:96:F8:32:4D:E2:FD:DA:57:27:2A']
+    }
+  }]);
 });
 
-// Catch-all — serve index.html
+// ── Static + SPA fallback ─────────────────────────────────────
+app.use(express.static(path.join(__dirname)));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 // ── Start ─────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', async () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`AI Mastery server running on port ${PORT}`);
-  await setupDatabase();
+  if (missing.length) {
+    console.warn(`⚠️  Missing env vars: ${missing.join(', ')}`);
+  } else {
+    console.log('✅ All environment variables present');
+  }
 });
